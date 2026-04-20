@@ -1,0 +1,586 @@
+name: Release mysql-fractalsql Packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch: {}
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------
+  # Linux: build fractalsql.so per arch. The UDF ABI is stable across
+  # MySQL 8.0 / 8.4 LTS / 9.x, so one .so per arch covers the whole
+  # supported range — no per-major fan-in.
+  #
+  # amd64 gets a native smoke test inside real mysql:8.0 AND mysql:8.4
+  # containers (edition + version + fractal_search cosine-similarity
+  # convergence) — same .so in, both containers out, which is the
+  # actual cross-major-ABI proof.
+  # arm64 skips the smoke test — QEMU + mysqld is too slow and flaky,
+  # and the Dockerfile's post-link assertions already validate the
+  # arm64 ABI (ldd shortlist, .dynsym exports, size ceiling).
+  # ------------------------------------------------------------------
+  build:
+    name: build ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: linux/amd64,linux/arm64
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build fractalsql.so for ${{ matrix.arch }}
+        run: |
+          chmod +x build.sh
+          ./build.sh ${{ matrix.arch }}
+          ls -l dist/${{ matrix.arch }}/fractalsql.so
+
+      - name: Smoke test (edition/version + fractal_search convergence)
+        if: matrix.arch == 'amd64'
+        run: |
+          set -euo pipefail
+          SO="dist/amd64/fractalsql.so"
+
+          # Password picked to avoid any possibility that a
+          # validate_password component (if the image loads it in a
+          # future release) would reject the env password during root
+          # initialization — 12+ chars, upper+lower+digit+symbol.
+          MYSQL_PW="FractalCI_Pass!1"
+
+          dump_container_diagnostics() {
+              local name="$1"
+              echo "::group::docker ps"
+              docker ps -a --filter "name=${name}"
+              echo "::endgroup::"
+              echo "::group::docker logs ${name}"
+              docker logs "${name}" 2>&1 || true
+              echo "::endgroup::"
+              echo "::group::docker inspect state"
+              docker inspect --format='State={{.State.Status}} ExitCode={{.State.ExitCode}} Error={{.State.Error}}' "${name}" 2>&1 || true
+              echo "::endgroup::"
+          }
+
+          # Validate the same fractalsql.so against both a current
+          # stable (8.0) and the current LTS (8.4). Same binary in,
+          # both containers out — proves the UDF ABI stability claim
+          # instead of just asserting it in commentary.
+          for TAG in 8.0 8.4; do
+              M="my-${TAG}"
+              echo "=============================================="
+              echo "  Smoke test against mysql:${TAG}"
+              echo "=============================================="
+
+              docker run -d --name "${M}" \
+                  -e MYSQL_ROOT_PASSWORD="${MYSQL_PW}" \
+                  "mysql:${TAG}"
+
+              # The mysql image runs a two-phase bootstrap: a temporary
+              # mysqld on the unix socket initializes the data dir and
+              # applies MYSQL_ROOT_PASSWORD, then the server restarts for
+              # production use. Polling `mysqladmin ping` can succeed
+              # during phase 1 BEFORE the password is applied, and
+              # subsequent -p"${MYSQL_PW}" calls then fail with "Access
+              # denied for user 'root'@'localhost' (using password: YES)"
+              # once phase 2 kicks in.
+              #
+              # Readiness here requires a full authenticated query, not
+              # just a TCP/socket ping — `SELECT 1` succeeds only once
+              # phase 2 is fully up AND the root password matches. The
+              # --protocol=socket path also sidesteps the TLS handshake
+              # MySQL 8.0+ enables on TCP by default (which produced
+              # "TLS/SSL error: Broken pipe (32)" in earlier runs).
+              READY=0
+              for i in $(seq 1 180); do
+                  if docker exec "${M}" \
+                         mysql --protocol=socket -uroot -p"${MYSQL_PW}" \
+                              -N -B -e "SELECT 1" >/dev/null 2>&1; then
+                      READY=1
+                      echo "[${TAG}] ready after ${i}s"
+                      break
+                  fi
+                  sleep 1
+              done
+              if [ "${READY}" != "1" ]; then
+                  echo "[${TAG}] FAIL: mysqld never accepted authenticated queries within 180s"
+                  dump_container_diagnostics "${M}"
+                  docker rm -f "${M}" || true
+                  exit 1
+              fi
+
+              # All subsequent client calls force --protocol=socket
+              # to stay off the TCP/TLS path.
+              MC="mysql --protocol=socket -uroot -p${MYSQL_PW}"
+
+              # Discover the actual plugin_dir from the running server —
+              # don't hardcode. Oracle's mysql:8.0 image sits on Oracle
+              # Linux and uses /usr/lib64/mysql/plugin/; Debian/Ubuntu
+              # mysql-server packages use /usr/lib/mysql/plugin/; some
+              # layouts use /usr/lib/mysql/plugins/ (plural). Trusting
+              # @@plugin_dir matches whatever mysqld is actually loading
+              # from.
+              PLUGIN_DIR=$(docker exec "${M}" ${MC} -N -B -e \
+                  "SELECT @@plugin_dir" | tr -d '\r')
+              if [ -z "${PLUGIN_DIR}" ]; then
+                  echo "[${TAG}] FAIL: could not read @@plugin_dir"
+                  dump_container_diagnostics "${M}"
+                  docker rm -f "${M}" || true
+                  exit 1
+              fi
+              # Trim a possible trailing slash so we can append
+              # '/fractalsql.so' unambiguously below.
+              PLUGIN_DIR="${PLUGIN_DIR%/}"
+              echo "[${TAG}] plugin_dir: ${PLUGIN_DIR}"
+              if ! docker exec "${M}" test -d "${PLUGIN_DIR}"; then
+                  echo "[${TAG}] FAIL: plugin_dir ${PLUGIN_DIR} missing inside container"
+                  docker exec "${M}" ls -la "$(dirname "${PLUGIN_DIR}")" || true
+                  dump_container_diagnostics "${M}"
+                  docker rm -f "${M}" || true
+                  exit 1
+              fi
+
+              docker cp "${SO}" "${M}:${PLUGIN_DIR}/fractalsql.so"
+              # docker exec without -i silently discards stdin, so the
+              # UDF registration SQL never reaches the mysql client.
+              # Always use docker exec -i for SQL piped from a file.
+              docker exec -i "${M}" ${MC} < sql/install_udf.sql
+
+              EDITION=$(docker exec "${M}" ${MC} -N -B -e \
+                  "SELECT fractalsql_edition();")
+              echo "[${TAG}] edition: ${EDITION}"
+              test "${EDITION}" = "Community"
+
+              VERSION=$(docker exec "${M}" ${MC} -N -B -e \
+                  "SELECT fractalsql_version();")
+              echo "[${TAG}] version: ${VERSION}"
+              test "${VERSION}" = "1.0.0"
+
+              # Convergence sanity check. query = (0.6, 0.8), objective
+              # is cosine distance. Cosine distance is magnitude-
+              # invariant, so every point on the ray through the origin
+              # and (0.6, 0.8) is a global optimum — the coordinates
+              # SFS returns can land anywhere along that ray inside
+              # [-1, 1]^2. We assert the invariant the optimizer is
+              # actually minimizing: cosine similarity to the query
+              # should be essentially 1. ||query||^2 = 0.6^2+0.8^2 = 1,
+              # so cos_sim simplifies to (v . query) / ||v||.
+              #
+              # CONVERT(... USING utf8mb4) wrapper: MySQL 8.0+ tags UDF
+              # STRING returns with CHARACTER SET 'binary' and then
+              # JSON_EXTRACT rejects them with ERROR 3144 ("Cannot
+              # create a JSON value from a string with CHARACTER SET
+              # 'binary'"). Re-tagging the payload as utf8mb4 is the
+              # canonical workaround; the bytes themselves are pure
+              # ASCII JSON so the conversion is a no-op. MariaDB's
+              # JSON_EXTRACT is permissive and doesn't need this.
+              RESULT=$(docker exec "${M}" ${MC} -N -B -e "
+                  SET @r = CONVERT(
+                      fractal_search('', '0.6,0.8', 1,
+                                     '{\"iterations\":100,\"population_size\":50}')
+                      USING utf8mb4);
+                  SELECT CASE
+                      WHEN SQRT(v1*v1 + v2*v2) > 1e-9
+                       AND (v1*0.6 + v2*0.8) / SQRT(v1*v1 + v2*v2) > 0.99
+                      THEN 'ok'
+                      ELSE CONCAT('FAIL v=', v1, ',', v2)
+                  END
+                  FROM (
+                      SELECT
+                        CAST(JSON_EXTRACT(@r, '\$.best_point[0]') AS DOUBLE) AS v1,
+                        CAST(JSON_EXTRACT(@r, '\$.best_point[1]') AS DOUBLE) AS v2
+                  ) t;")
+              echo "[${TAG}] convergence: ${RESULT}"
+              test "${RESULT}" = "ok"
+
+              docker rm -f "${M}"
+          done
+
+      - name: Upload .so artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-fractalsql-${{ matrix.arch }}-so
+          path: dist/${{ matrix.arch }}/fractalsql.so
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------
+  # One packaging cell per arch. Pulls the per-arch .so from the build
+  # jobs, runs scripts/package.sh to produce .deb + .rpm, and verifies
+  # no luajit runtime dep leaked into the package metadata.
+  # ------------------------------------------------------------------
+  package:
+    name: package ${{ matrix.arch }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Download fractalsql.so
+        uses: actions/download-artifact@v4
+        with:
+          name: mysql-fractalsql-${{ matrix.arch }}-so
+          path: dist/${{ matrix.arch }}
+
+      - name: Install Packaging Tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ruby ruby-dev build-essential rpm
+          sudo gem install --no-document fpm
+
+      - name: Build .deb and .rpm for ${{ matrix.arch }}
+        run: |
+          chmod +x scripts/package.sh
+          scripts/package.sh ${{ matrix.arch }}
+          ls -l dist/packages
+
+      - name: Verify packages declare no luajit dependency
+        run: |
+          set -euo pipefail
+          for deb in dist/packages/*-${{ matrix.arch }}.deb; do
+              echo "=== ${deb} ==="
+              DEPS=$(dpkg-deb -f "${deb}" Depends)
+              echo "Depends: ${DEPS}"
+              if echo "${DEPS}" | grep -iE 'luajit'; then
+                  echo "FAIL: ${deb} declares a luajit dependency" >&2
+                  exit 1
+              fi
+          done
+          for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
+              echo "=== ${rpm} ==="
+              REQS=$(rpm -qpR "${rpm}" || true)
+              echo "Requires:"
+              echo "${REQS}"
+              if echo "${REQS}" | grep -iE '^luajit'; then
+                  echo "FAIL: ${rpm} declares a luajit requirement" >&2
+                  exit 1
+              fi
+          done
+
+      - name: Verify packages ship LICENSE files
+        run: |
+          set -euo pipefail
+          for deb in dist/packages/*-${{ matrix.arch }}.deb; do
+              echo "=== ${deb} ==="
+              CONTENTS=$(dpkg-deb -c "${deb}")
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/mysql-fractalsql/LICENSE$'
+              echo "${CONTENTS}" | grep -E 'usr/share/doc/mysql-fractalsql/LICENSE-THIRD-PARTY$'
+          done
+          for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
+              echo "=== ${rpm} ==="
+              CONTENTS=$(rpm -qlp "${rpm}")
+              echo "${CONTENTS}" | grep -E '/usr/share/doc/mysql-fractalsql/LICENSE$'
+              echo "${CONTENTS}" | grep -E '/usr/share/doc/mysql-fractalsql/LICENSE-THIRD-PARTY$'
+          done
+
+      - name: Verify plugin .so lands at the right per-distro path
+        run: |
+          # The .so must land where each distro's mysql-server package
+          # sets plugin_dir — otherwise CREATE FUNCTION ... SONAME
+          # 'fractalsql.so' silently fails to load.
+          #   Debian/Ubuntu:  /usr/lib/mysql/plugin/
+          #   RHEL/EL9:       /usr/lib64/mysql/plugin/
+          # CI caught the latent mismatch when the mysql:8.0 image
+          # (Oracle Linux 9 build, 8.0.45-1.el9) reported
+          # @@plugin_dir = /usr/lib64/mysql/plugin/ and the old staging
+          # dropped the .so at /usr/lib/ only.
+          set -euo pipefail
+          for deb in dist/packages/*-${{ matrix.arch }}.deb; do
+              echo "=== ${deb} ==="
+              dpkg-deb -c "${deb}" \
+                  | grep -E 'usr/lib/mysql/plugin/fractalsql\.so$'
+          done
+          for rpm in dist/packages/*-${{ matrix.arch }}.rpm; do
+              echo "=== ${rpm} ==="
+              rpm -qlp "${rpm}" \
+                  | grep -E '/usr/lib64/mysql/plugin/fractalsql\.so$'
+          done
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-fractalsql-${{ matrix.arch }}
+          path: dist/packages/*
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/packages/*
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ------------------------------------------------------------------
+  # Windows: fractalsql.dll + FractalSQL-MySQL-<MAJOR>-<VER>-x64.msi
+  #
+  # Matrix — x64 only.
+  #   x86   : Oracle does not publish 32-bit Windows server binaries
+  #           on the current MySQL majors (8.0+), so there's no host
+  #           server for a 32-bit UDF DLL.
+  #   arm64 : Oracle does not yet ship Windows ARM64 server binaries
+  #           in an extractable .zip form on 8.x/9.x — deferring this
+  #           cell per the brief ("defer rather than half-implement").
+  #   x64   : full coverage for 8.0 / 8.4 LTS / 9.x via the official
+  #           downloads.mysql.com mysql-<VER>-winx64.zip publishes.
+  #
+  # The minor versions pinned below (8.0.41 etc.) are current as of
+  # the first tagged release; bump MYSQL_VER when rolling forward.
+  # If a pin goes stale (downloads.mysql.com 404s), CI fails at the
+  # download step.
+  # ------------------------------------------------------------------
+  build-windows-msi:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mysql_major: "8.0"
+            mysql_ver:   "8.0.41"
+            arch: x64
+            runner: windows-latest
+          - mysql_major: "8.4"
+            mysql_ver:   "8.4.4"
+            arch: x64
+            runner: windows-latest
+          - mysql_major: "9.1"
+            mysql_ver:   "9.1.0"
+            arch: x64
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    name: windows my${{ matrix.mysql_major }} / ${{ matrix.arch }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up MSVC dev cmd (${{ matrix.arch }})
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.arch }}
+
+      - name: Install WiX Toolset (provides candle.exe + light.exe)
+        shell: pwsh
+        run: |
+          choco install -y --no-progress wixtoolset
+
+          # On the x64 runner, choco shims candle/light into
+          # C:\ProgramData\chocolatey\bin automatically. Still, locate
+          # the real bin and append it to $GITHUB_PATH to cover
+          # chocolatey shim drift and future ARM64 runners.
+          $wixBin = $null
+          $candidates = @(
+            "C:\Program Files (x86)\WiX Toolset v3.14\bin",
+            "C:\Program Files\WiX Toolset v3.14\bin",
+            "C:\Program Files (x86)\WiX Toolset v3.11\bin"
+          )
+          foreach ($c in $candidates) {
+            if (Test-Path (Join-Path $c "candle.exe")) { $wixBin = $c; break }
+          }
+          if (-not $wixBin) {
+            Write-Host "Searching under Program Files for candle.exe..."
+            $hit = Get-ChildItem -Path "C:\Program Files (x86)", "C:\Program Files" `
+                     -Recurse -Filter "candle.exe" -ErrorAction SilentlyContinue `
+                   | Select-Object -First 1
+            if ($hit) { $wixBin = $hit.DirectoryName }
+          }
+          if (-not $wixBin) {
+            Write-Host "FATAL: candle.exe not found after choco install wixtoolset"
+            exit 1
+          }
+          Write-Host "WiX bin dir: $wixBin"
+          Add-Content -Path $env:GITHUB_PATH -Value $wixBin
+
+      - name: Clone + build static LuaJIT 2.1 with MSVC
+        shell: cmd
+        run: |
+          if not exist deps mkdir deps
+          git clone --depth 1 --branch v2.1 https://github.com/LuaJIT/LuaJIT.git deps\LuaJIT
+          cd deps\LuaJIT\src
+          call msvcbuild.bat static
+          if not exist lua51.lib (
+            echo ==^> LuaJIT static build failed
+            exit /b 1
+          )
+          dir lua51.lib lua.h
+
+      - name: Download + unpack MySQL ${{ matrix.mysql_ver }} ${{ matrix.arch }} binaries
+        shell: pwsh
+        env:
+          MYSQL_VER: ${{ matrix.mysql_ver }}
+          MYSQL_MAJOR: ${{ matrix.mysql_major }}
+        run: |
+          # Oracle hosts per-version winx64 zips that contain a full
+          # mysql-<VER>-winx64\ tree including include\ with the UDF
+          # headers. UDFs do not need a server import lib — the server
+          # loads the DLL and calls the exported entry points by name.
+          #
+          # Download sources (tried in order):
+          #   1. Archives CDN (downloads.mysql.com/archives/get/p/23/file/)
+          #      — reliable direct-to-file path. Product id 23 = MySQL
+          #      Community Server. Every released version stays here.
+          #   2. Current-downloads redirect (dev.mysql.com/get/) — Oracle's
+          #      front-end sometimes returns an HTML "fw_error_www"
+          #      firewall page instead of the redirect when automated
+          #      clients hit it without a session cookie, so this URL is
+          #      only a fallback.
+          $zipName   = "mysql-${env:MYSQL_VER}-winx64.zip"
+          $urls = @(
+              "https://downloads.mysql.com/archives/get/p/23/file/$zipName",
+              "https://dev.mysql.com/get/Downloads/MySQL-${env:MYSQL_MAJOR}/$zipName"
+          )
+          New-Item -ItemType Directory -Force -Path deps\mysql | Out-Null
+          $dest = "deps\mysql\mysql.zip"
+          $downloaded = $false
+          foreach ($url in $urls) {
+              for ($attempt = 1; $attempt -le 3; $attempt++) {
+                  Write-Host "Fetching (attempt $attempt) $url"
+                  try {
+                      # UA header: plain "curl/8.0" tends to bypass
+                      # Oracle's JS-session bot check on dev.mysql.com.
+                      Invoke-WebRequest -Uri $url `
+                          -OutFile $dest `
+                          -UseBasicParsing `
+                          -MaximumRedirection 10 `
+                          -Headers @{ "User-Agent" = "curl/8.0" } `
+                          -TimeoutSec 300
+                  } catch {
+                      Write-Host "  -> $($_.Exception.Message)"
+                      Start-Sleep -Seconds (5 * $attempt)
+                      continue
+                  }
+                  # Guard against Oracle returning a 200 OK with an HTML
+                  # error page: real zip files start with 'PK' (0x50 0x4B).
+                  $headBytes = [System.IO.File]::ReadAllBytes($dest) |
+                                 Select-Object -First 4
+                  if ($headBytes[0] -ne 0x50 -or $headBytes[1] -ne 0x4B) {
+                      Write-Host "  -> got non-ZIP payload; retrying"
+                      $preview = Get-Content $dest -TotalCount 30 -ErrorAction SilentlyContinue
+                      if ($preview) {
+                          Write-Host "first bytes preview:"
+                          $preview | Select-Object -First 10 | ForEach-Object { Write-Host "    $_" }
+                      }
+                      Remove-Item $dest -ErrorAction SilentlyContinue
+                      Start-Sleep -Seconds (5 * $attempt)
+                      continue
+                  }
+                  $downloaded = $true
+                  break
+              }
+              if ($downloaded) { break }
+          }
+          if (-not $downloaded) {
+              Write-Host "FATAL: could not fetch $zipName from any mirror"
+              exit 1
+          }
+
+          Expand-Archive -Path $dest -DestinationPath "deps\mysql" -Force
+
+          $unpacked = "deps\mysql\mysql-${env:MYSQL_VER}-winx64"
+          if (Test-Path $unpacked) {
+            Rename-Item -Path $unpacked -NewName "root"
+          } else {
+            Write-Host "FATAL: expected $unpacked inside $zipName"
+            Get-ChildItem deps\mysql -Recurse -Depth 2 | Format-Table
+            exit 1
+          }
+          if (-not (Test-Path "deps\mysql\root\include\mysql.h")) {
+            Write-Host "FATAL: include\mysql.h missing from unpacked tree"
+            Get-ChildItem "deps\mysql\root\include" -ErrorAction SilentlyContinue | Format-Table
+            exit 1
+          }
+
+      - name: Build fractalsql.dll (/MT static CRT, /GL WPO, MySQL ${{ matrix.mysql_major }})
+        shell: cmd
+        env:
+          MYSQL_MAJOR: ${{ matrix.mysql_major }}
+        run: |
+          set LUAJIT_DIR=%CD%\deps\LuaJIT\src
+          set MYSQL_DIR=%CD%\deps\mysql\root
+          set OUT_DIR=%CD%\dist\windows\my%MYSQL_MAJOR%
+          if not exist "%OUT_DIR%" mkdir "%OUT_DIR%"
+          call scripts\windows\build.bat
+          if errorlevel 1 exit /b 1
+          dir "%OUT_DIR%\fractalsql.dll"
+
+      - name: Smoke-check fractalsql.dll dependencies (dumpbin)
+        shell: pwsh
+        env:
+          MYSQL_MAJOR: ${{ matrix.mysql_major }}
+        run: |
+          $dll = "dist\windows\my${env:MYSQL_MAJOR}\fractalsql.dll"
+          $deps = dumpbin /dependents $dll
+          Write-Host ($deps -join "`n")
+          if ($deps -match 'vcruntime|msvcp140|msvcr\d') {
+              Write-Host '==> FAIL: .dll depends on MSVC redistributable DLLs'
+              exit 1
+          }
+          if ($deps -match 'lua51\.dll|libluajit') {
+              Write-Host '==> FAIL: .dll depends on a dynamic LuaJIT'
+              exit 1
+          }
+          Write-Host '==> OK: static CRT + static LuaJIT posture'
+
+      - name: Verify UDF entry points exported (dumpbin /exports)
+        shell: pwsh
+        env:
+          MYSQL_MAJOR: ${{ matrix.mysql_major }}
+        run: |
+          $dll = "dist\windows\my${env:MYSQL_MAJOR}\fractalsql.dll"
+          $exports = dumpbin /exports $dll
+          Write-Host ($exports -join "`n")
+          foreach ($sym in @(
+                'fractal_search','fractal_search_init','fractal_search_deinit',
+                'fractalsql_edition','fractalsql_edition_init','fractalsql_edition_deinit',
+                'fractalsql_version','fractalsql_version_init','fractalsql_version_deinit')) {
+              if (-not ($exports -match "\b$sym\b")) {
+                  Write-Host "==> FAIL: $sym missing from export table"
+                  exit 1
+              }
+          }
+          Write-Host '==> OK: all UDF entry points exported'
+
+      - name: Build MSI (candle + light, MySQL ${{ matrix.mysql_major }} / ${{ matrix.arch }})
+        shell: cmd
+        env:
+          MYSQL_MAJOR: ${{ matrix.mysql_major }}
+          MSI_ARCH:    ${{ matrix.arch }}
+        run: |
+          call scripts\windows\build-msi.bat
+          if errorlevel 1 exit /b 1
+          dir dist\windows\*.msi
+
+      - name: Upload MSI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-fractalsql-windows-my${{ matrix.mysql_major }}-${{ matrix.arch }}
+          path: dist/windows/FractalSQL-MySQL-${{ matrix.mysql_major }}-*-${{ matrix.arch }}.msi
+          if-no-files-found: error
+
+      - name: Upload to Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/windows/FractalSQL-MySQL-${{ matrix.mysql_major }}-*-${{ matrix.arch }}.msi
+          fail_on_unmatched_files: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
